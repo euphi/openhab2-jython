@@ -1,5 +1,10 @@
-import uuid
 import java.util
+from java.nio.file.StandardWatchEventKinds import ENTRY_CREATE, ENTRY_DELETE, ENTRY_MODIFY
+
+import inspect
+import json
+import uuid
+
 from org.eclipse.smarthome.automation import Trigger
 from org.eclipse.smarthome.automation.handler import TriggerHandler
 from org.eclipse.smarthome.automation.type import TriggerType
@@ -11,6 +16,8 @@ from openhab.log import logging
 import openhab
 from openhab.jsr223 import scope, get_automation_manager
 scope.scriptExtension.importPreset("RuleSimple")
+
+from openhab.osgi.events import OsgiEventTrigger
 
 class ItemStateUpdateTrigger(Trigger):
     def __init__(self, itemName, state=None, triggerName=None):
@@ -61,7 +68,45 @@ class StartupTrigger(Trigger):
         triggerName = triggerName or uuid.uuid1().hex
         Trigger.__init__(self, triggerName, openhab.STARTUP_MODULE_ID, Configuration())
     
+# Item Registry Triggers
+
+class ItemRegistryTrigger(OsgiEventTrigger):
+    def __init__(self, event_name):
+        OsgiEventTrigger.__init__(self)
+        self.event_name = event_name
         
+    def event_filter(self, event):
+        return event.get('type') == self.event_name
+    
+    def event_transformer(self, event):
+        return json.loads(event['payload'])
+
+class ItemAddedTrigger(ItemRegistryTrigger):
+    def __init__(self):
+        ItemRegistryTrigger.__init__(self, "ItemAddedEvent")
+        
+class ItemRemovedTrigger(ItemRegistryTrigger):
+     def __init__(self):
+        ItemRegistryTrigger.__init__(self, "ItemRemovedEvent")
+
+class ItemUpdatedTrigger(ItemRegistryTrigger):
+    def __init__(self):
+        ItemRegistryTrigger.__init__(self, "ItemUpdatedEvent")
+        
+# Directory watcher trigger
+
+class DirectoryEventTrigger(Trigger):
+    def __init__(self, path, event_kinds=[ENTRY_CREATE, ENTRY_DELETE, ENTRY_MODIFY], watch_subdirectories=False):
+        triggerId = type(self).__name__ + "-" + uuid.uuid1().hex
+        config = Configuration({
+            'path': path,
+            'event_kinds': str(event_kinds),
+            'watch_subdirectories': watch_subdirectories,
+        })
+        Trigger.__init__(self, triggerId, openhab.DIRECTORY_TRIGGER_MODULE_ID, config)
+
+# Function decorator trigger support
+
 class _FunctionRule(scope.SimpleRule):
     def __init__(self, callback, triggers, extended=False):
         self.triggers = triggers
@@ -88,13 +133,14 @@ ITEM_COMMAND = "ItemCommandEvent"
 
 def item_triggered(item_name, event_types=None, result_item_name=None):
     event_types = event_types or [ITEM_CHANGE]
+    event_bus = scope.events
     if hasattr(event_types, '__iter__'):
         event_types = ",".join(event_types)
     def decorator(fn):
         def callback(module, inputs):
             result_value = fn()
             if result_item_name:
-                scope.events.postUpdate(result_item_name, str(result_value))
+                event_bus.postUpdate(result_item_name, unicode(result_value))
         rule = _FunctionRule(callback, [ItemEventTrigger(item_name, event_types)], extended=True)
         get_automation_manager().addRule(rule)
         return fn
@@ -103,20 +149,23 @@ def item_triggered(item_name, event_types=None, result_item_name=None):
 
 def item_group_triggered(group_name, event_types=None, result_item_name=None):
     event_types = event_types or [ITEM_CHANGE]
+    event_bus = scope.events
     if hasattr(event_types, '__iter__'):
         event_types = ",".join(event_types)
     def decorator(fn):
-        dlog = logging.getLogger("RULES.oh2-jython.triggers.item_group_triggered")
-
+        nargs = len(inspect.getargspec(fn).args)
         def callback(module, inputs):
-            result_value = fn()
+            fn_args = []
+            event = inputs.get('event')
+            if event and nargs == 1:
+                fn_args.append(event)
+            result_value = fn(*fn_args)
             if result_item_name:
-                scope.events.postUpdate(result_item_name, str(result_value))
+                event_bus.postUpdate(result_item_name, unicode(result_value))
         group_triggers = []
-        groupitems = scope.itemRegistry.getItem(group_name)
-        for i in groupitems.getAllMembers():
-            group_triggers.append(ItemEventTrigger(unicode(i.name), event_types))
-            dlog.debug("   added ItemStateUpdateTrigger for " + unicode(i.name))
+        group = scope.itemRegistry.getItem(group_name)
+        for i in group.getAllMembers():
+            group_triggers.append(ItemEventTrigger(i.name, event_types))
         rule = _FunctionRule(callback, group_triggers, extended=True)
         get_automation_manager().addRule(rule)
         return fn
